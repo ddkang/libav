@@ -1610,8 +1610,6 @@ static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame 
         decode_mb_mode(s, mb, mb_x, mb_y, curframe->ref_index[0] + mb_xy,
                        prev_frame && prev_frame->ref_index[0] ? prev_frame->ref_index[0] + mb_xy : NULL);
 
-        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_PREVIOUS);
-
         if (!mb->skip)
             decode_mb_coeffs(s, c, mb, s->top_nnz[mb_x], s->left_nnz);
 
@@ -1619,8 +1617,6 @@ static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame 
             intra_predict(s, dst, mb, mb_x, mb_y);
         else
             inter_predict(s, dst, mb, mb_x, mb_y);
-
-        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_GOLDEN);
 
         if (!mb->skip) {
             idct_mb(s, dst, mb);
@@ -1637,8 +1633,6 @@ static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame 
 
         if (s->deblock_filter)
             filter_level_for_mb(s, mb, &s->filter_strength[mb_x]);
-
-        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_GOLDEN2);
 
         dst[0] += 16;
         dst[1] += 8;
