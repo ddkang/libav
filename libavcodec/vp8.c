@@ -121,7 +121,7 @@ static int update_dimensions(VP8Context *s, int width, int height)
     s->mb_width  = (s->avctx->coded_width +15) / 16;
     s->mb_height = (s->avctx->coded_height+15) / 16;
 
-    s->macroblocks_base        = av_mallocz((s->mb_width+s->mb_height*2+1)*sizeof(*s->macroblocks));
+    s->macroblocks_base        = av_mallocz((s->mb_width+2)*(s->mb_height+2)*sizeof(*s->macroblocks));
     s->filter_strength         = av_mallocz(s->mb_width*sizeof(*s->filter_strength));
     s->intra4x4_pred_mode_top  = av_mallocz(s->mb_width*4);
     s->top_nnz                 = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
@@ -131,7 +131,7 @@ static int update_dimensions(VP8Context *s, int width, int height)
         !s->top_nnz || !s->top_border)
         return AVERROR(ENOMEM);
 
-    s->macroblocks        = s->macroblocks_base + 1;
+    s->macroblocks        = s->macroblocks_base + s->mb_width + 2;
 
     return 0;
 }
@@ -472,7 +472,7 @@ int decode_splitmvs(VP8Context *s, VP56RangeCoder *c, VP8Macroblock *mb)
 {
     int part_idx;
     int n, num;
-    VP8Macroblock *top_mb  = &mb[2];
+    VP8Macroblock *top_mb  = &mb[-s->mb_width-1];
     VP8Macroblock *left_mb = &mb[-1];
     const uint8_t *mbsplits_left = vp8_mbsplits[left_mb->partitioning],
                   *mbsplits_top = vp8_mbsplits[top_mb->partitioning],
@@ -534,9 +534,9 @@ int decode_splitmvs(VP8Context *s, VP56RangeCoder *c, VP8Macroblock *mb)
 static av_always_inline
 void decode_mvs(VP8Context *s, VP8Macroblock *mb, int mb_x, int mb_y)
 {
-    VP8Macroblock *mb_edge[3] = { mb + 2 /* top */,
+    VP8Macroblock *mb_edge[3] = { mb - s->mb_width-1 /* top */,
                                   mb - 1 /* left */,
-                                  mb + 1 /* top-left */ };
+                                  mb - s->mb_width-2 /* top-left */ };
     enum { CNT_ZERO, CNT_NEAREST, CNT_NEAR, CNT_SPLITMV };
     enum { VP8_EDGE_TOP, VP8_EDGE_LEFT, VP8_EDGE_TOPLEFT };
     int idx = CNT_ZERO;
@@ -1578,7 +1578,7 @@ static void release_queued_segmaps(VP8Context *s, int is_close)
 static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame *prev_frame, int mb_y) {
     VP8Context *s = avctx->priv_data;
     VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
-    VP8Macroblock *mb = s->macroblocks + (s->mb_height - mb_y - 1)*2;
+    VP8Macroblock *mb = s->macroblocks + ((s->mb_width+1)*(mb_y + 1) + 1);
     int i, y, mb_x, mb_xy = mb_y*s->mb_width;
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
@@ -1757,7 +1757,7 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     memset(s->top_nnz, 0, s->mb_width*sizeof(*s->top_nnz));
 
     /* Zero macroblock structures for top/top-left prediction from outside the frame. */
-    memset(s->macroblocks + s->mb_height*2 - 1, 0, (s->mb_width+1)*sizeof(*s->macroblocks));
+    memset(s->macroblocks_base, 0, (s->mb_width+1)*sizeof(*s->macroblocks));
 
     // top edge of 127 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
