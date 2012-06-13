@@ -79,8 +79,14 @@ typedef struct {
     uint8_t mode;
     uint8_t ref_frame;
     uint8_t partitioning;
+    uint8_t chroma_pred_mode;
+    uint8_t segment;
+    uint8_t intra4x4_pred_mode_mb[16];
+    uint8_t intra4x4_pred_mode_top[4];
+    uint8_t intra4x4_pred_mode_left[4];
     VP56mv mv;
     VP56mv bmv[16];
+    VP8FilterStrength filter_strength;
 } VP8Macroblock;
 
 typedef struct {
@@ -97,8 +103,6 @@ typedef struct {
     uint8_t keyframe;
     uint8_t deblock_filter;
     uint8_t mbskip_enabled;
-    uint8_t segment;             ///< segment of the current macroblock
-    uint8_t chroma_pred_mode;    ///< 8x8c pred mode of the current macroblock
     uint8_t profile;
     VP56mv mv_min;
     VP56mv mv_max;
@@ -126,10 +130,6 @@ typedef struct {
     } filter;
 
     VP8Macroblock *macroblocks;
-    VP8FilterStrength *filter_strength;
-
-    uint8_t *intra4x4_pred_mode_top;
-    uint8_t intra4x4_pred_mode_left[4];
 
     /**
      * Macroblocks can have one of 4 different quants in a frame when
@@ -193,7 +193,6 @@ typedef struct {
     VP56RangeCoder c;   ///< header context, includes mb modes and motion vectors
     DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
     DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
-    uint8_t intra4x4_pred_mode_mb[16];
 
     /**
      * These are all of the updatable probabilities for binary decisions.
