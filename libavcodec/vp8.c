@@ -1578,6 +1578,32 @@ static void release_queued_segmaps(VP8Context *s, int is_close)
 }
 
 #define MARGIN (16 << 2)
+static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVFrame *prev_frame) {
+    VP8Context *s = avctx->priv_data;
+    int mb_x, mb_y;
+
+    s->mv_min.y = -MARGIN;
+    s->mv_max.y = ((s->mb_height - 1) << 6) + MARGIN;
+    for (mb_y = 0; mb_y < s->mb_height; mb_y++) {
+        VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
+        int mb_xy = mb_y*s->mb_width;
+
+        memset(mb - 1, 0, sizeof(*mb));   // zero left macroblock
+        AV_WN32A((mb-1)->intra4x4_pred_mode_left, DC_PRED*0x01010101);
+
+        s->mv_min.x = -MARGIN;
+        s->mv_max.x = ((s->mb_width  - 1) << 6) + MARGIN;
+        for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
+            decode_mb_mode(s, mb, mb_x, mb_y, curframe->ref_index[0] + mb_xy,
+                           prev_frame && prev_frame->ref_index[0] ? prev_frame->ref_index[0] + mb_xy : NULL);
+            s->mv_min.x -= 64;
+            s->mv_max.x -= 64;
+        }
+        s->mv_min.y -= 64;
+        s->mv_max.y -= 64;
+    }
+}
+
 static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame *prev_frame, int mb_y) {
     VP8Context *s = avctx->priv_data;
     VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
@@ -1589,9 +1615,7 @@ static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame 
         curframe->data[2] +  8*mb_y*s->uvlinesize
     };
 
-    memset(mb - 1, 0, sizeof(*mb));   // zero left macroblock
     memset(s->left_nnz, 0, sizeof(s->left_nnz));
-    AV_WN32A((mb-1)->intra4x4_pred_mode_left, DC_PRED*0x01010101);
 
     // left edge of 129 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
@@ -1609,9 +1633,6 @@ static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, AVFrame 
         /* Prefetch the current frame, 4 MBs ahead */
         s->dsp.prefetch(dst[0] + (mb_x&3)*4*s->linesize + 64, s->linesize, 4);
         s->dsp.prefetch(dst[1] + (mb_x&7)*s->uvlinesize + 64, dst[2] - dst[1], 2);
-
-        decode_mb_mode(s, mb, mb_x, mb_y, curframe->ref_index[0] + mb_xy,
-                       prev_frame && prev_frame->ref_index[0] ? prev_frame->ref_index[0] + mb_xy : NULL);
 
         prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_PREVIOUS);
 
@@ -1773,6 +1794,12 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
         for (i = 0; i < s->mb_width+1; i++, mb++)
             memset(mb->intra4x4_pred_mode_top, DC_PRED, 4);
     }
+
+    // Make sure the previous frame has read its segmentation map,
+    // if we re-use the same map.
+    if (prev_frame && s->segmentation.enabled && !s->segmentation.update_map)
+        ff_thread_await_progress(prev_frame, 1, 0);
+    vp8_decode_mv_mb_modes(avctx, curframe, prev_frame);
 
     s->mv_min.y = -MARGIN;
     s->mv_max.y = ((s->mb_height - 1) << 6) + MARGIN;
