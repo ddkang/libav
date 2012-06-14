@@ -199,20 +199,6 @@ typedef struct {
         int8_t ref[4];
     } lf_delta;
 
-    /**
-     * Cache of the top row needed for intra prediction
-     * 16 for luma, 8 for each chroma plane
-     */
-    uint8_t (*top_border)[16+8+8];
-
-    /**
-     * For coeff decode, we need to know whether the above block had non-zero
-     * coefficients. This means for each macroblock, we need data for 4 luma
-     * blocks, 2 u blocks, 2 v blocks, and the luma dc block, for a total of 9
-     * per macroblock. We keep the last row in top_nnz.
-     */
-    uint8_t (*top_nnz)[9];
-
     VP56RangeCoder c;   ///< header context, includes mb modes and motion vectors
 
     /**

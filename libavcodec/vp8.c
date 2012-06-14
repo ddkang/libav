@@ -22,6 +22,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <pthread.h>
+
 #include "libavutil/imgutils.h"
 #include "avcodec.h"
 #include "internal.h"
@@ -37,9 +39,7 @@
 static void free_buffers(VP8Context *s)
 {
     av_freep(&s->macroblocks_base);
-    av_freep(&s->top_nnz);
     av_freep(&s->edge_emu_buffer);
-    av_freep(&s->top_border);
 
     s->macroblocks = NULL;
 }
@@ -122,16 +122,15 @@ static int update_dimensions(VP8Context *s, int width, int height)
     s->mb_height = (s->avctx->coded_height+15) / 16;
 
     s->macroblocks_base        = av_mallocz((s->mb_width+2)*(s->mb_height+2)*sizeof(*s->macroblocks));
-    s->top_nnz                 = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
-    s->top_border              = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
 
     for (i = 0; i < MAX_THREADS; i++) {
         s->thread_data[i] = av_mallocz(sizeof(VP8ThreadData));
-        s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
-        s->thread_data[i]->top_nnz    = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
+        s->thread_data[i]->thread_mb_x = -1;
+        s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->thread_data[i]->top_border));
+        s->thread_data[i]->top_nnz    = av_mallocz((s->mb_width+1)*sizeof(*s->thread_data[i]->top_nnz));
     }
 
-    if (!s->macroblocks_base || !s->top_nnz || !s->top_border)
+    if (!s->macroblocks_base)
         return AVERROR(ENOMEM);
 
     s->macroblocks        = s->macroblocks_base + s->mb_width + 1;
@@ -997,7 +996,7 @@ void intra_predict(VP8Context *s, VP8ThreadData *td, uint8_t *dst[3],
     // for the first row, we need to run xchg_mb_border to init the top edge to 127
     // otherwise, skip it if we aren't going to deblock
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y))
-        xchg_mb_border(s->top_border[mb_x+1], dst[0], dst[1], dst[2],
+        xchg_mb_border(td->top_border[mb_x+1], dst[0], dst[1], dst[2],
                        s->linesize, s->uvlinesize, mb_x, mb_y, s->mb_width,
                        s->filter.simple, 1);
 
@@ -1103,7 +1102,7 @@ void intra_predict(VP8Context *s, VP8ThreadData *td, uint8_t *dst[3],
     s->hpc.pred8x8[mode](dst[2], s->uvlinesize);
 
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y))
-        xchg_mb_border(s->top_border[mb_x+1], dst[0], dst[1], dst[2],
+        xchg_mb_border(td->top_border[mb_x+1], dst[0], dst[1], dst[2],
                        s->linesize, s->uvlinesize, mb_x, mb_y, s->mb_width,
                        s->filter.simple, 0);
 }
@@ -1543,7 +1542,7 @@ static av_always_inline void filter_mb_simple(VP8Context *s, uint8_t *dst, VP8Fi
     }
 }
 
-static void filter_mb_row(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
+static void filter_mb_row(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
 {
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
@@ -1554,7 +1553,7 @@ static void filter_mb_row(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, i
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
         VP8FilterStrength *f = &mb->filter_strength;
-        backup_mb_border(s->top_border[mb_x+1], dst[0], dst[1], dst[2], s->linesize, s->uvlinesize, 0);
+        backup_mb_border(td->top_border[mb_x+1], dst[0], dst[1], dst[2], s->linesize, s->uvlinesize, 0);
         filter_mb(s, dst, f, mb_x, mb_y);
         dst[0] += 16;
         dst[1] += 8;
@@ -1562,14 +1561,14 @@ static void filter_mb_row(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, i
     }
 }
 
-static void filter_mb_row_simple(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
+static void filter_mb_row_simple(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
 {
     uint8_t *dst = curframe->data[0] + 16*mb_y*s->linesize;
     int mb_x;
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
         VP8FilterStrength *f = &mb->filter_strength;
-        backup_mb_border(s->top_border[mb_x+1], dst, NULL, NULL, s->linesize, 0, 1);
+        backup_mb_border(td->top_border[mb_x+1], dst, NULL, NULL, s->linesize, 0, 1);
         filter_mb_simple(s, dst, f++, mb_x, mb_y);
         dst += 16;
     }
@@ -1610,7 +1609,8 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     }
 }
 
-static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata) {
+// Make threadnr a power of 2.
+static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = tdata;
     int mb_y = td->mb_y;
@@ -1618,6 +1618,8 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata) {
     AVFrame *curframe = td->curframe;
     VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
     VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
+    int tmp = FFMIN(s->num_coeff_partitions, avctx->thread_count);
+    VP8ThreadData *prev_td = s->thread_data[((s->thread_data[0]-td)/sizeof(VP8ThreadData)+tmp)%tmp];
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
         curframe->data[1] +  8*mb_y*s->uvlinesize,
@@ -1631,17 +1633,33 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata) {
         for (i = 0; i < 3; i++)
             for (y = 0; y < 16>>!!i; y++)
                 dst[i][y*curframe->linesize[i]-1] = 129;
-        if (mb_y == 1) // top left edge is also 129
-            s->top_border[0][15] = s->top_border[0][23] = s->top_border[0][31] = 129;
+        if (mb_y == 1)
+            td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
     }
 
+    // Set up threading specific stuff.
+    pthread_mutex_lock(&td->lock);
+    td->thread_mb_x = -1;
+    pthread_mutex_unlock(&td->lock);
+
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
-        /* Prefetch the current frame, 4 MBs ahead */
-        s->dsp.prefetch(dst[0] + (mb_x&3)*4*s->linesize + 64, s->linesize, 4);
-        s->dsp.prefetch(dst[1] + (mb_x&7)*s->uvlinesize + 64, dst[2] - dst[1], 2);
+        if (prev_td != td) {
+            int t = -1;
+            while (t <= mb_x+1) {
+                pthread_mutex_lock(&prev_td->lock);
+                t = prev_td->thread_mb_x;
+                pthread_mutex_unlock(&prev_td->lock);
+            }
+            if (mb_y != 0)
+                memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
+            if (mb_y != 0)
+                memcpy(td->top_border[mb_x], prev_td->top_border[mb_x], sizeof(td->top_border[mb_x]));
+            if (mb_y == 1 && mb_x == 0) // top left edge is also 129
+                td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
+        }
 
         if (!mb->skip)
-            decode_mb_coeffs(s, td, c, mb, s->top_nnz[mb_x], td->left_nnz);
+            decode_mb_coeffs(s, td, c, mb, td->top_nnz[mb_x], td->left_nnz);
 
         if (mb->mode <= MODE_I4x4)
             intra_predict(s, td, dst, mb, mb_x, mb_y);
@@ -1652,12 +1670,12 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata) {
             idct_mb(s, td, dst, mb);
         } else {
             AV_ZERO64(td->left_nnz);
-            AV_WN64(s->top_nnz[mb_x], 0);   // array of 9, so unaligned
+            AV_WN64(td->top_nnz[mb_x], 0);   // array of 9, so unaligned
 
             // Reset DC block predictors if they would exist if the mb had coefficients
             if (mb->mode != MODE_I4x4 && mb->mode != VP8_MVMODE_SPLIT) {
-                td->left_nnz[8]     = 0;
-                s->top_nnz[mb_x][8] = 0;
+                td->left_nnz[8]      = 0;
+                td->top_nnz[mb_x][8] = 0;
             }
         }
 
@@ -1667,82 +1685,24 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata) {
         dst[0] += 16;
         dst[1] += 8;
         dst[2] += 8;
+        pthread_mutex_lock(&td->lock);
+        td->thread_mb_x = mb_x;
+        pthread_mutex_unlock(&td->lock);
     }
     if (s->deblock_filter) {
         mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
         if (s->filter.simple)
-            filter_mb_row_simple(s, curframe, mb, mb_y);
+            filter_mb_row_simple(s, td, curframe, mb, mb_y);
         else
-            filter_mb_row(s, curframe, mb, mb_y);
+            filter_mb_row(s, td, curframe, mb, mb_y);
     }
 }
-/*
-static void vp8_decode_mb_row(AVCodecContext *avctx, AVFrame *curframe, int mb_y) {
-    VP8Context *s = avctx->priv_data;
-    VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
-    VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
-    int i, y, mb_x, mb_xy = mb_y*s->mb_width;
-    uint8_t *dst[3] = {
-        curframe->data[0] + 16*mb_y*s->linesize,
-        curframe->data[1] +  8*mb_y*s->uvlinesize,
-        curframe->data[2] +  8*mb_y*s->uvlinesize
-    };
 
-    memset(s->left_nnz, 0, sizeof(s->left_nnz));
-
-    // left edge of 129 for intra prediction
-    if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
-        for (i = 0; i < 3; i++)
-            for (y = 0; y < 16>>!!i; y++)
-                dst[i][y*curframe->linesize[i]-1] = 129;
-        if (mb_y == 1) // top left edge is also 129
-            s->top_border[0][15] = s->top_border[0][23] = s->top_border[0][31] = 129;
-    }
-
-    for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
-
-        if (!mb->skip)
-            ;//decode_mb_coeffs(s, c, mb, s->top_nnz[mb_x], s->left_nnz);
-
-        if (mb->mode <= MODE_I4x4)
-            ;//intra_predict(s, dst, mb, mb_x, mb_y);
-        else
-            ;//inter_predict(s, dst, mb, mb_x, mb_y);
-
-        if (!mb->skip) {
-            idct_mb(s, dst, mb);
-        } else {
-            AV_ZERO64(s->left_nnz);
-            AV_WN64(s->top_nnz[mb_x], 0);   // array of 9, so unaligned
-
-            // Reset DC block predictors if they would exist if the mb had coefficients
-            if (mb->mode != MODE_I4x4 && mb->mode != VP8_MVMODE_SPLIT) {
-                s->left_nnz[8]      = 0;
-                s->top_nnz[mb_x][8] = 0;
-            }
-        }
-
-        if (s->deblock_filter)
-            filter_level_for_mb(s, mb);
-
-        dst[0] += 16;
-        dst[1] += 8;
-        dst[2] += 8;
-    }
-    if (s->deblock_filter) {
-        mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
-        if (s->filter.simple)
-            filter_mb_row_simple(s, curframe, mb, mb_y);
-        else
-            filter_mb_row(s, curframe, mb, mb_y);
-    }
-}
-*/
 static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
                             AVPacket *avpkt)
 {
     VP8Context *s = avctx->priv_data;
-    int ret, mb_y, i, referenced;
+    int ret, mb_y, i, referenced, num_jobs;
     enum AVDiscard skip_thresh;
     AVFrame *av_uninit(curframe), *prev_frame;
 
@@ -1836,15 +1796,15 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     if (!s->edge_emu_buffer)
         s->edge_emu_buffer = av_malloc(21*s->linesize);
 
-    memset(s->top_nnz, 0, s->mb_width*sizeof(*s->top_nnz));
+    memset(s->thread_data[0]->top_nnz, 0, s->mb_width*sizeof(*s->thread_data[0]->top_nnz));
 
     /* Zero macroblock structures for top/top-left prediction from outside the frame. */
     memset(s->macroblocks_base, 0, (s->mb_width+1)*sizeof(*s->macroblocks));
 
     // top edge of 127 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
-        s->top_border[0][15] = s->top_border[0][23] = 127;
-        memset(s->top_border[1]-1, 127, s->mb_width*sizeof(*s->top_border)+1);
+        s->thread_data[0]->top_border[0][15] = s->thread_data[0]->top_border[0][23] = 127;
+        memset(s->thread_data[0]->top_border[1]-1, 127, s->mb_width*sizeof(*s->thread_data[0]->top_border)+1);
     }
     memset(s->ref_count, 0, sizeof(s->ref_count));
     if (s->keyframe) {
@@ -1859,13 +1819,16 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
         ff_thread_await_progress(prev_frame, 1, 0);
     vp8_decode_mv_mb_modes(avctx, curframe, prev_frame);
 
+    num_jobs = FFMIN(s->num_coeff_partitions, avctx->thread_count);
     for (mb_y = 0; mb_y < s->mb_height; mb_y++) {
         if (prev_frame && s->segmentation.enabled && !s->segmentation.update_map)
             ff_thread_await_progress(prev_frame, mb_y, 0);
 
-        s->thread_data[0]->mb_y = mb_y;
-        s->thread_data[0]->curframe = curframe;
-        vp8_decode_mb_row_sliced(avctx, s->thread_data[0]);
+        for (i = 0; i < num_jobs; i++) {
+            s->thread_data[i]->mb_y = mb_y;
+            s->thread_data[i]->curframe = curframe;
+        }
+        vp8_decode_mb_row_sliced(avctx, s->thread_data[0], 0, 0);
         //vp8_decode_mb_row(avctx, curframe, mb_y);
 
         ff_thread_report_progress(curframe, mb_y, 0);
@@ -1958,7 +1921,7 @@ AVCodec ff_vp8_decoder = {
     .init                  = vp8_decode_init,
     .close                 = vp8_decode_free,
     .decode                = vp8_decode_frame,
-    .capabilities          = CODEC_CAP_DR1 | CODEC_CAP_FRAME_THREADS,
+    .capabilities          = CODEC_CAP_DR1 | CODEC_CAP_FRAME_THREADS | CODEC_CAP_SLICE_THREADS,
     .flush                 = vp8_decode_flush,
     .long_name             = NULL_IF_CONFIG_SMALL("On2 VP8"),
     .init_thread_copy      = ONLY_IF_THREADS_ENABLED(vp8_decode_init_thread_copy),
