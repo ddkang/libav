@@ -1788,6 +1788,10 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
             memset(mb->intra4x4_pred_mode_top, DC_PRED, 4);
     }
 
+    // Make sure the previous frame has read its segmentation map, 
+    // if we re-use the same map.
+    if (prev_frame && s->segmentation.enabled && !s->segmentation.update_map)
+        ff_thread_await_progress(prev_frame, 1, 0);
     vp8_decode_mv_mb_modes(avctx, curframe, prev_frame);
 
     s->mv_min.y = -MARGIN;
