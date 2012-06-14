@@ -90,6 +90,38 @@ typedef struct {
 } VP8Macroblock;
 
 typedef struct {
+    pthread_mutex_t lock;
+    int thread_mb_x;
+    int mb_y;
+    /**
+     * For coeff decode, we need to know whether the above block had non-zero
+     * coefficients. This means for each macroblock, we need data for 4 luma
+     * blocks, 2 u blocks, 2 v blocks, and the luma dc block, for a total of 9
+     * per macroblock. We keep the last row in top_nnz.
+     */
+    uint8_t (*top_nnz)[9];
+    DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
+    /**
+     * Cache of the top row needed for intra prediction
+     * 16 for luma, 8 for each chroma plane
+     */
+    uint8_t (*top_border)[16+8+8];
+    /**
+     * This is the index plus one of the last non-zero coeff
+     * for each of the blocks in the current macroblock.
+     * So, 0 -> no coeffs
+     *     1 -> dc-only (special transform)
+     *     2+-> full transform
+     */
+    DECLARE_ALIGNED(16, uint8_t, non_zero_count_cache)[6][4];
+    DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
+    DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
+    AVFrame *curframe;
+} VP8ThreadData;
+
+#define MAX_THREADS 10
+typedef struct {
+    VP8ThreadData *thread_data[MAX_THREADS];
     AVCodecContext *avctx;
     AVFrame *framep[4];
     AVFrame *next_framep[4];
@@ -180,19 +212,8 @@ typedef struct {
      * per macroblock. We keep the last row in top_nnz.
      */
     uint8_t (*top_nnz)[9];
-    DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
 
-    /**
-     * This is the index plus one of the last non-zero coeff
-     * for each of the blocks in the current macroblock.
-     * So, 0 -> no coeffs
-     *     1 -> dc-only (special transform)
-     *     2+-> full transform
-     */
-    DECLARE_ALIGNED(16, uint8_t, non_zero_count_cache)[6][4];
     VP56RangeCoder c;   ///< header context, includes mb modes and motion vectors
-    DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
-    DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
 
     /**
      * These are all of the updatable probabilities for binary decisions.
