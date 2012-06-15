@@ -199,6 +199,9 @@ typedef struct {
         int8_t ref[4];
     } lf_delta;
 
+    uint8_t (*top_border)[16+8+8];
+    uint8_t (*top_nnz)[9];
+
     VP56RangeCoder c;   ///< header context, includes mb modes and motion vectors
 
     /**
@@ -252,6 +255,7 @@ typedef struct {
     uint8_t *segmentation_maps[5];
     int num_maps_to_be_freed;
     int maps_are_invalid;
+    int num_jobs;
 } VP8Context;
 
 #endif /* AVCODEC_VP8_H */

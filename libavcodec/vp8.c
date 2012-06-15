@@ -39,7 +39,9 @@
 static void free_buffers(VP8Context *s)
 {
     av_freep(&s->macroblocks_base);
+    av_freep(&s->top_nnz);
     av_freep(&s->edge_emu_buffer);
+    av_freep(&s->top_border);
 
     s->macroblocks = NULL;
 }
@@ -122,15 +124,18 @@ static int update_dimensions(VP8Context *s, int width, int height)
     s->mb_height = (s->avctx->coded_height+15) / 16;
 
     s->macroblocks_base        = av_mallocz((s->mb_width+2)*(s->mb_height+2)*sizeof(*s->macroblocks));
+    s->top_nnz                 = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
+    s->top_border              = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
+
 
     for (i = 0; i < MAX_THREADS; i++) {
         s->thread_data[i] = av_mallocz(sizeof(VP8ThreadData));
         s->thread_data[i]->thread_mb_x = -1;
-        s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->thread_data[i]->top_border));
-        s->thread_data[i]->top_nnz    = av_mallocz((s->mb_width+1)*sizeof(*s->thread_data[i]->top_nnz));
+        s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
+        s->thread_data[i]->top_nnz    = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
     }
 
-    if (!s->macroblocks_base)
+    if (!s->macroblocks_base || !s->top_nnz || !s->top_border)
         return AVERROR(ENOMEM);
 
     s->macroblocks        = s->macroblocks_base + s->mb_width + 1;
@@ -1609,17 +1614,16 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     }
 }
 
-// Make threadnr a power of 2.
-static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
+static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
-    VP8ThreadData *td = tdata;
+    VP8ThreadData *td = s->thread_data[jobnr];
     int mb_y = td->mb_y;
     int i, y, mb_x, mb_xy = mb_y*s->mb_width;
+    int num_jobs = s->num_jobs;
     AVFrame *curframe = td->curframe;
     VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
     VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
-    int tmp = FFMIN(s->num_coeff_partitions, avctx->thread_count);
-    VP8ThreadData *prev_td = s->thread_data[((s->thread_data[0]-td)/sizeof(VP8ThreadData)+tmp)%tmp];
+    VP8ThreadData *prev_td = s->thread_data[FFMAX(0, threadnr-1)], *next_td = s->thread_data[FFMIN(threadnr+1,num_jobs-1)];
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
         curframe->data[1] +  8*mb_y*s->uvlinesize,
@@ -1637,23 +1641,24 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int job
             td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
     }
 
-    // Set up threading specific stuff.
-    pthread_mutex_lock(&td->lock);
-    td->thread_mb_x = -1;
-    pthread_mutex_unlock(&td->lock);
-
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
         if (prev_td != td) {
             int t = -1;
-            while (t <= mb_x+1) {
+            while (t < mb_x+1 && t != -2) {
                 pthread_mutex_lock(&prev_td->lock);
                 t = prev_td->thread_mb_x;
                 pthread_mutex_unlock(&prev_td->lock);
             }
-            if (mb_y != 0)
+            if (mb_y != 0) {
                 memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
-            if (mb_y != 0)
                 memcpy(td->top_border[mb_x], prev_td->top_border[mb_x], sizeof(td->top_border[mb_x]));
+            }
+            if (mb_y == 1 && mb_x == 0) // top left edge is also 129
+                td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
+        }
+        else if (mb_y != 0 && num_jobs != 1) {
+            memcpy(td->top_nnz[mb_x], s->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
+            memcpy(td->top_border[mb_x], s->top_border[mb_x], sizeof(td->top_nnz[mb_x]));
             if (mb_y == 1 && mb_x == 0) // top left edge is also 129
                 td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
         }
@@ -1689,6 +1694,17 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int job
         td->thread_mb_x = mb_x;
         pthread_mutex_unlock(&td->lock);
     }
+    pthread_mutex_lock(&td->lock);
+    td->thread_mb_x = -2;
+    pthread_mutex_unlock(&td->lock);
+    if (next_td != td) {
+        int t = 0;
+        while (t != -2) {
+            pthread_mutex_lock(&next_td->lock);
+            t = next_td->thread_mb_x;
+            pthread_mutex_unlock(&next_td->lock);
+        }
+    }
     if (s->deblock_filter) {
         mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
         if (s->filter.simple)
@@ -1696,6 +1712,11 @@ static void vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int job
         else
             filter_mb_row(s, td, curframe, mb, mb_y);
     }
+    if (threadnr == num_jobs - 1) {
+        memcpy(s->top_nnz, td->top_nnz, s->mb_width*sizeof(*s->top_nnz));
+        memcpy(s->top_border, td->top_border, (s->mb_width+1)*sizeof(*s->top_border));
+    }
+    return 0;
 }
 
 static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
@@ -1820,16 +1841,18 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     vp8_decode_mv_mb_modes(avctx, curframe, prev_frame);
 
     num_jobs = FFMIN(s->num_coeff_partitions, avctx->thread_count);
-    for (mb_y = 0; mb_y < s->mb_height; mb_y++) {
-        if (prev_frame && s->segmentation.enabled && !s->segmentation.update_map)
-            ff_thread_await_progress(prev_frame, mb_y, 0);
-
+    for (mb_y = 0; mb_y < (s->mb_height+num_jobs-1)/num_jobs; mb_y++) {
         for (i = 0; i < num_jobs; i++) {
-            s->thread_data[i]->mb_y = mb_y;
+            s->thread_data[i]->mb_y = mb_y*num_jobs + i;
             s->thread_data[i]->curframe = curframe;
+            s->thread_data[i]->thread_mb_x = -1;
+            if (mb_y*num_jobs + i >= s->mb_height) {
+                num_jobs = i;
+                break;
+            }
         }
-        vp8_decode_mb_row_sliced(avctx, s->thread_data[0], 0, 0);
-        //vp8_decode_mb_row(avctx, curframe, mb_y);
+        s->num_jobs = num_jobs;
+        avctx->execute2(avctx, vp8_decode_mb_row_sliced, s->thread_data, NULL, num_jobs);
 
         ff_thread_report_progress(curframe, mb_y, 0);
     }
