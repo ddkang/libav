@@ -91,6 +91,7 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t lock;
+    pthread_cond_t  cond;
     int thread_mb_x;
     int mb_y;
     /**

@@ -133,6 +133,8 @@ static int update_dimensions(VP8Context *s, int width, int height)
         s->thread_data[i]->thread_mb_x = -1;
         s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
         s->thread_data[i]->top_nnz    = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
+        pthread_mutex_init(&s->thread_data[i]->lock, NULL);
+        pthread_cond_init(&s->thread_data[i]->cond, NULL);
     }
 
     if (!s->macroblocks_base || !s->top_nnz || !s->top_border)
@@ -1566,6 +1568,27 @@ static void filter_mb_row(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, V
     }
 }
 
+static void filter_mb_single(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, VP8Macroblock *mb, int mb_y, int mb_x)
+{
+     uint8_t *dst[3] = {
+        curframe->data[0] + 16*mb_y*s->linesize   + 16*mb_x,
+        curframe->data[1] +  8*mb_y*s->uvlinesize + 16*mb_x,
+        curframe->data[2] +  8*mb_y*s->uvlinesize + 16*mb_x
+    };
+
+    VP8FilterStrength *f = &mb->filter_strength;
+    backup_mb_border(td->top_border[mb_x+1], dst[0], dst[1], dst[2], s->linesize, s->uvlinesize, 0);
+    filter_mb(s, dst, f, mb_x, mb_y);
+}
+
+static void filter_mb_single_simple(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, VP8Macroblock *mb, int mb_y, int mb_x)
+{
+    uint8_t *dst = curframe->data[0] + 16*mb_y*s->linesize + 16*mb_x;
+    VP8FilterStrength *f = &mb->filter_strength;
+    backup_mb_border(td->top_border[mb_x+1], dst, NULL, NULL, s->linesize, 0, 1);
+    filter_mb_simple(s, dst, f, mb_x, mb_y);
+}
+
 static void filter_mb_row_simple(VP8Context *s, VP8ThreadData *td, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
 {
     uint8_t *dst = curframe->data[0] + 16*mb_y*s->linesize;
@@ -1574,7 +1597,7 @@ static void filter_mb_row_simple(VP8Context *s, VP8ThreadData *td, AVFrame *curf
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
         VP8FilterStrength *f = &mb->filter_strength;
         backup_mb_border(td->top_border[mb_x+1], dst, NULL, NULL, s->linesize, 0, 1);
-        filter_mb_simple(s, dst, f++, mb_x, mb_y);
+        filter_mb_simple(s, dst, f, mb_x, mb_y);
         dst += 16;
     }
 }
@@ -1616,7 +1639,7 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
 
 static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
-    VP8ThreadData *td = s->thread_data[jobnr];
+    VP8ThreadData *td = s->thread_data[threadnr];
     int mb_y = td->mb_y;
     int i, y, mb_x, mb_xy = mb_y*s->mb_width;
     int num_jobs = s->num_jobs;
@@ -1632,6 +1655,10 @@ static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobn
 
     memset(td->left_nnz, 0, sizeof(td->left_nnz));
 
+    if (threadnr == 0) {
+        memcpy(td->top_nnz, s->top_nnz, s->mb_width*sizeof(*s->top_nnz));
+        memcpy(td->top_border, s->top_border, (s->mb_width+1)*sizeof(*s->top_border));
+    }
     // left edge of 129 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
         for (i = 0; i < 3; i++)
@@ -1644,22 +1671,20 @@ static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobn
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
         if (prev_td != td) {
             int t = -1;
-            while (t < mb_x+1 && t != -2) {
-                pthread_mutex_lock(&prev_td->lock);
+            pthread_mutex_lock(&prev_td->lock);
+            do {
                 t = prev_td->thread_mb_x;
-                pthread_mutex_unlock(&prev_td->lock);
-            }
-            if (mb_y != 0) {
-                memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
-                memcpy(td->top_border[mb_x], prev_td->top_border[mb_x], sizeof(td->top_border[mb_x]));
-            }
-            if (mb_y == 1 && mb_x == 0) // top left edge is also 129
-                td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
-        }
-        else if (mb_y != 0 && num_jobs != 1) {
-            memcpy(td->top_nnz[mb_x], s->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
-            memcpy(td->top_border[mb_x], s->top_border[mb_x], sizeof(td->top_nnz[mb_x]));
-            if (mb_y == 1 && mb_x == 0) // top left edge is also 129
+                if (t > s->mb_width) break;
+                //if (t > mb_x+3) break;
+                pthread_cond_wait(&prev_td->cond, &prev_td->lock);
+            } while (1);
+            pthread_mutex_unlock(&prev_td->lock);
+            memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
+            if (mb_x > 0) { memcpy(td->top_border[mb_x-1], prev_td->top_border[mb_x-1], sizeof(*s->top_border)); }
+            memcpy(td->top_border[mb_x],   prev_td->top_border[mb_x],   sizeof(*s->top_border));
+            memcpy(td->top_border[mb_x+1], prev_td->top_border[mb_x+1], sizeof(*s->top_border));
+            if (mb_x != s->mb_width-1) memcpy(td->top_border[mb_x+2], prev_td->top_border[mb_x+2], sizeof(*s->top_border));
+            if (mb_y == 1) // top left edge is also 129
                 td->top_border[0][15] = td->top_border[0][23] = td->top_border[0][31] = 129;
         }
 
@@ -1691,19 +1716,12 @@ static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobn
         dst[1] += 8;
         dst[2] += 8;
         pthread_mutex_lock(&td->lock);
-        td->thread_mb_x = mb_x;
+/*        if (mb_x == s->mb_width-1)
+            td->thread_mb_x = INT_MAX;
+        else*/
+            td->thread_mb_x = mb_x;
+        pthread_cond_signal(&td->cond);
         pthread_mutex_unlock(&td->lock);
-    }
-    pthread_mutex_lock(&td->lock);
-    td->thread_mb_x = -2;
-    pthread_mutex_unlock(&td->lock);
-    if (next_td != td) {
-        int t = 0;
-        while (t != -2) {
-            pthread_mutex_lock(&next_td->lock);
-            t = next_td->thread_mb_x;
-            pthread_mutex_unlock(&next_td->lock);
-        }
     }
     if (s->deblock_filter) {
         mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
@@ -1716,6 +1734,11 @@ static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobn
         memcpy(s->top_nnz, td->top_nnz, s->mb_width*sizeof(*s->top_nnz));
         memcpy(s->top_border, td->top_border, (s->mb_width+1)*sizeof(*s->top_border));
     }
+
+    pthread_mutex_lock(&td->lock);
+    td->thread_mb_x = INT_MAX;
+    pthread_cond_signal(&td->cond);
+    pthread_mutex_unlock(&td->lock);
     return 0;
 }
 
@@ -1817,15 +1840,15 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
     if (!s->edge_emu_buffer)
         s->edge_emu_buffer = av_malloc(21*s->linesize);
 
-    memset(s->thread_data[0]->top_nnz, 0, s->mb_width*sizeof(*s->thread_data[0]->top_nnz));
+    memset(s->top_nnz, 0, s->mb_width*sizeof(*s->top_nnz));
 
     /* Zero macroblock structures for top/top-left prediction from outside the frame. */
     memset(s->macroblocks_base, 0, (s->mb_width+1)*sizeof(*s->macroblocks));
 
     // top edge of 127 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
-        s->thread_data[0]->top_border[0][15] = s->thread_data[0]->top_border[0][23] = 127;
-        memset(s->thread_data[0]->top_border[1]-1, 127, s->mb_width*sizeof(*s->thread_data[0]->top_border)+1);
+        s->top_border[0][15] = s->top_border[0][23] = 127;
+        memset(s->top_border[1]-1, 127, s->mb_width*sizeof(*s->top_border)+1);
     }
     memset(s->ref_count, 0, sizeof(s->ref_count));
     if (s->keyframe) {
@@ -1842,19 +1865,20 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
 
     num_jobs = FFMIN(s->num_coeff_partitions, avctx->thread_count);
     for (mb_y = 0; mb_y < (s->mb_height+num_jobs-1)/num_jobs; mb_y++) {
+        int t = num_jobs;
         for (i = 0; i < num_jobs; i++) {
             s->thread_data[i]->mb_y = mb_y*num_jobs + i;
             s->thread_data[i]->curframe = curframe;
             s->thread_data[i]->thread_mb_x = -1;
             if (mb_y*num_jobs + i >= s->mb_height) {
-                num_jobs = i;
+                t = i;
                 break;
             }
         }
-        s->num_jobs = num_jobs;
-        avctx->execute2(avctx, vp8_decode_mb_row_sliced, s->thread_data, NULL, num_jobs);
+        s->num_jobs = t;
+        avctx->execute2(avctx, vp8_decode_mb_row_sliced, s->thread_data, NULL, t);
 
-        ff_thread_report_progress(curframe, mb_y, 0);
+        ff_thread_report_progress(curframe, mb_y*num_jobs, 0);
     }
 
     ff_thread_report_progress(curframe, INT_MAX, 0);
