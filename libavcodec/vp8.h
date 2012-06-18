@@ -92,6 +92,7 @@ typedef struct {
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  cond;
+    int thread_nr;
     int thread_mb_x;
     int mb_y;
     /**
@@ -106,7 +107,7 @@ typedef struct {
      * Cache of the top row needed for intra prediction
      * 16 for luma, 8 for each chroma plane
      */
-    uint8_t (*top_border)[16+8+8];
+    //uint8_t (*top_border)[16+8+8];
     /**
      * This is the index plus one of the last non-zero coeff
      * for each of the blocks in the current macroblock.
