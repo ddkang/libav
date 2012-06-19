@@ -1614,7 +1614,7 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     }
 }
 
-static int vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
+static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = s->thread_data[threadnr];
     int mb_y = td->mb_y;
@@ -1650,14 +1650,16 @@ static int vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int j
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
         if (prev_td != td) {
-            int t = -1;
-            pthread_mutex_lock(&prev_td->lock);
-            do {
-                t = prev_td->thread_mb_x;
-                if (t >= mb_x+1) break;
-                pthread_cond_wait(&prev_td->cond, &prev_td->lock);
-            } while (1);
-            pthread_mutex_unlock(&prev_td->lock);
+            int t = prev_td->thread_mb_x;
+            if (t < mb_x+1) {
+                pthread_mutex_lock(&prev_td->lock);
+                do {
+                    t = prev_td->thread_mb_x;
+                    if (t >= mb_x+1) break;
+                    pthread_cond_wait(&prev_td->cond, &prev_td->lock);
+                } while (1);
+                pthread_mutex_unlock(&prev_td->lock);
+            }
             memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
         }
 
@@ -1714,8 +1716,6 @@ static int vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int j
     td->thread_mb_x = s->mb_width;
     pthread_cond_broadcast(&td->cond);
     pthread_mutex_unlock(&td->lock);
-
-    return 0;
 }
 
 static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
@@ -1738,24 +1738,28 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
         VP8FilterStrength *f = &mb->filter_strength;
 
         if (prev_td != td) {
-            int t = -1;
-            pthread_mutex_lock(&prev_td->lock);
-            do {
-                t = prev_td->thread_mb_x - (s->mb_width+1);
-                if (t >= mb_x+1) break;
-                pthread_cond_wait(&prev_td->cond, &prev_td->lock);
-            } while (1);
-            pthread_mutex_unlock(&prev_td->lock);
+            int t = prev_td->thread_mb_x - (s->mb_width+1);
+            if (t < mb_x+1) {
+                pthread_mutex_lock(&prev_td->lock);
+                do {
+                    t = prev_td->thread_mb_x - (s->mb_width+1);
+                    if (t >= mb_x+1) break;
+                    pthread_cond_wait(&prev_td->cond, &prev_td->lock);
+                } while (1);
+                pthread_mutex_unlock(&prev_td->lock);
+            }
         }
         if (next_td != td) {
-            int t = -1;
-            pthread_mutex_lock(&next_td->lock);
-            do {
-                t = next_td->thread_mb_x;
-                if (t >= mb_x+2) break;
-                pthread_cond_wait(&next_td->cond, &next_td->lock);
-            } while (1);
-            pthread_mutex_unlock(&next_td->lock);
+            int t = next_td->thread_mb_x;
+            if (t < mb_x+2) {
+                pthread_mutex_lock(&next_td->lock);
+                do {
+                    t = next_td->thread_mb_x;
+                    if (t >= mb_x+2) break;
+                    pthread_cond_wait(&next_td->cond, &next_td->lock);
+                } while (1);
+                pthread_mutex_unlock(&next_td->lock);
+            }
         }
 
         if (s->filter.simple)
