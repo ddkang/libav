@@ -1549,36 +1549,6 @@ static av_always_inline void filter_mb_simple(VP8Context *s, uint8_t *dst, VP8Fi
     }
 }
 
-static void filter_mb_row(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
-{
-    uint8_t *dst[3] = {
-        curframe->data[0] + 16*mb_y*s->linesize,
-        curframe->data[1] +  8*mb_y*s->uvlinesize,
-        curframe->data[2] +  8*mb_y*s->uvlinesize
-    };
-    int mb_x;
-
-    for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
-        VP8FilterStrength *f = &mb->filter_strength;
-        filter_mb(s, dst, f, mb_x, mb_y);
-        dst[0] += 16;
-        dst[1] += 8;
-        dst[2] += 8;
-    }
-}
-
-static void filter_mb_row_simple(VP8Context *s, AVFrame *curframe, VP8Macroblock *mb, int mb_y)
-{
-    uint8_t *dst = curframe->data[0] + 16*mb_y*s->linesize;
-    int mb_x;
-
-    for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
-        VP8FilterStrength *f = &mb->filter_strength;
-        filter_mb_simple(s, dst, f, mb_x, mb_y);
-        dst += 16;
-    }
-}
-
 static void release_queued_segmaps(VP8Context *s, int is_close)
 {
     int leave_behind = is_close ? 0 : !s->maps_are_invalid;
@@ -1721,11 +1691,8 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
 static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = s->thread_data[threadnr];
-    int mb_y = td->mb_y;
-    int i, y, mb_x, mb_xy = mb_y*s->mb_width;
-    int num_jobs = s->num_jobs;
+    int mb_x, mb_y = td->mb_y, num_jobs = s->num_jobs;
     AVFrame *curframe = td->curframe;
-    VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
     VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
     VP8ThreadData *prev_td = s->thread_data[FFMAX(0, threadnr-1)], *next_td = s->thread_data[FFMIN(threadnr+1,num_jobs-1)];
     uint8_t *dst[3] = {
