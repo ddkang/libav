@@ -95,6 +95,7 @@ typedef struct {
     int thread_nr;
     int thread_mb_x;
     int mb_y;
+    uint8_t *edge_emu_buffer;
     /**
      * For coeff decode, we need to know whether the above block had non-zero
      * coefficients. This means for each macroblock, we need data for 4 luma
@@ -127,7 +128,6 @@ typedef struct {
     AVCodecContext *avctx;
     AVFrame *framep[4];
     AVFrame *next_framep[4];
-    uint8_t *edge_emu_buffer;
 
     uint16_t mb_width;   /* number of horizontal MB */
     uint16_t mb_height;  /* number of vertical MB */
