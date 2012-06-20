@@ -129,7 +129,6 @@ static int update_dimensions(VP8Context *s, int width, int height)
 
     for (i = 0; i < MAX_THREADS; i++) {
         s->thread_data[i] = av_mallocz(sizeof(VP8ThreadData));
-        s->thread_data[i]->thread_mb_x = -1;
         //s->thread_data[i]->top_border = av_mallocz((s->mb_width+1)*sizeof(*s->top_border));
         s->thread_data[i]->top_nnz    = av_mallocz(s->mb_width*sizeof(*s->top_nnz));
         pthread_mutex_init(&s->thread_data[i]->lock, NULL);
@@ -1001,7 +1000,7 @@ void intra_predict(VP8Context *s, VP8ThreadData *td, uint8_t *dst[3],
 
     // for the first row, we need to run xchg_mb_border to init the top edge to 127
     // otherwise, skip it if we aren't going to deblock
-    if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y) && td->thread_nr == 0)
+    if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y) && s->num_jobs == 1)
         xchg_mb_border(s->top_border[mb_x+1], dst[0], dst[1], dst[2],
                        s->linesize, s->uvlinesize, mb_x, mb_y, s->mb_width,
                        s->filter.simple, 1);
@@ -1107,7 +1106,7 @@ void intra_predict(VP8Context *s, VP8ThreadData *td, uint8_t *dst[3],
     s->hpc.pred8x8[mode](dst[1], s->uvlinesize);
     s->hpc.pred8x8[mode](dst[2], s->uvlinesize);
 
-    if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y) && td->thread_nr == 0)
+    if (!(avctx->flags & CODEC_FLAG_EMU_EDGE && !mb_y) && (s->deblock_filter || !mb_y) && s->num_jobs == 1)
         xchg_mb_border(s->top_border[mb_x+1], dst[0], dst[1], dst[2],
                        s->linesize, s->uvlinesize, mb_x, mb_y, s->mb_width,
                        s->filter.simple, 0);
@@ -1584,25 +1583,56 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     }
 }
 
+#undef printf
+#define check_lock(td, otd, mb_x_check, mb_y_check, check2)\
+    do {\
+        int tmp = otd->thread_mb_pos;\
+        int otd_mb_y = tmp >> 16;\
+        int otd_mb_x = tmp & 0xFFFF;\
+        /*printf("%d %d %d %d %d\n", otd_mb_y, otd_mb_x, mb_y_check, mb_x_check, check2);*/\
+        if (otd_mb_y < (mb_y_check) || (otd_mb_y == (mb_y_check) && otd_mb_x < (mb_x_check))) {\
+            pthread_mutex_lock(&otd->lock);\
+            do {\
+                tmp = otd->thread_mb_pos;\
+                otd_mb_y = tmp >> 16;\
+                otd_mb_x = tmp & 0xFFFF;\
+                /*printf("%d %d %d %d %d\n", otd_mb_y, otd_mb_x, mb_y_check, mb_x_check, check2);*/\
+                if (otd_mb_y > (mb_y_check)) break;\
+                if (otd_mb_y == (mb_y_check) && otd_mb_x >= (mb_x_check)) break;\
+                pthread_cond_wait(&otd->cond, &otd->lock);\
+            } while (1);\
+            pthread_mutex_unlock(&otd->lock);\
+        }\
+    } while(0);
+#define signal_lock(td, pos)\
+    pthread_mutex_lock(&td->lock);\
+    td->thread_mb_pos = (pos);\
+    pthread_cond_broadcast(&td->cond);\
+    pthread_mutex_unlock(&td->lock);
+
 static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = s->thread_data[threadnr];
-    int mb_y = td->mb_y;
+    int mb_y = td->thread_mb_pos>>16;
     int i, y, mb_x, mb_xy = mb_y*s->mb_width;
     int num_jobs = s->num_jobs;
     AVFrame *curframe = td->curframe;
     VP56RangeCoder *c = &s->coeff_partition[mb_y & (s->num_coeff_partitions-1)];
     VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
-    VP8ThreadData *prev_td = s->thread_data[FFMAX(0, threadnr-1)], *next_td = s->thread_data[FFMIN(threadnr+1,num_jobs-1)];
+    VP8ThreadData *prev_td, *next_td;
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
         curframe->data[1] +  8*mb_y*s->uvlinesize,
         curframe->data[2] +  8*mb_y*s->uvlinesize
     };
     td->thread_nr = threadnr;
+    if (mb_y == 0) prev_td = td;
+    else           prev_td = s->thread_data[(jobnr+num_jobs-1)%num_jobs];
+    if (mb_y == s->mb_height-1) next_td = td;
+    else                        next_td = s->thread_data[(jobnr+1)%num_jobs];
 
     memset(td->left_nnz, 0, sizeof(td->left_nnz));
-    if (threadnr == 0)
+    if (prev_td == td)
         memcpy(td->top_nnz, s->top_nnz, s->mb_width*sizeof(*s->top_nnz));
     // left edge of 129 for intra prediction
     if (!(avctx->flags & CODEC_FLAG_EMU_EDGE)) {
@@ -1619,17 +1649,12 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
     }
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb_xy++, mb++) {
+        // Wait for previous thread to read mb_x+1, and reach mb_y-1.
         if (prev_td != td) {
-            int t = prev_td->thread_mb_x;
-            if (t < mb_x+1) {
-                pthread_mutex_lock(&prev_td->lock);
-                do {
-                    t = prev_td->thread_mb_x;
-                    if (t >= mb_x+1) break;
-                    pthread_cond_wait(&prev_td->cond, &prev_td->lock);
-                } while (1);
-                pthread_mutex_unlock(&prev_td->lock);
-            }
+            int asdf = AV_READ_TIME();
+            check_lock(td, prev_td, mb_x+1, mb_y-1, 1);
+            asdf = AV_READ_TIME() - asdf;
+            //printf("1: %d %d\n", threadnr, asdf);
             memcpy(td->top_nnz[mb_x], prev_td->top_nnz[mb_x], sizeof(td->top_nnz[mb_x]));
         }
 
@@ -1661,12 +1686,9 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         dst[1] += 8;
         dst[2] += 8;
 
-        pthread_mutex_lock(&td->lock);
-        td->thread_mb_x = mb_x;
-        pthread_cond_broadcast(&td->cond);
-        pthread_mutex_unlock(&td->lock);
+        signal_lock(td, (mb_y<<16) | mb_x);
     }
-    if (threadnr == num_jobs - 1) {
+    if (num_jobs == 1) {
         dst[0] = curframe->data[0] + 16*mb_y*s->linesize;
         dst[1] = curframe->data[1] +  8*mb_y*s->uvlinesize;
         dst[2] = curframe->data[2] +  8*mb_y*s->uvlinesize;
@@ -1682,52 +1704,36 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         memcpy(s->top_nnz, td->top_nnz, s->mb_width*sizeof(*s->top_nnz));
     }
 
-    pthread_mutex_lock(&td->lock);
-    td->thread_mb_x = s->mb_width;
-    pthread_cond_broadcast(&td->cond);
-    pthread_mutex_unlock(&td->lock);
+    signal_lock(td, (mb_y<<16) | s->mb_width+2);
 }
 
 static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = s->thread_data[threadnr];
-    int mb_x, mb_y = td->mb_y, num_jobs = s->num_jobs;
+    int mb_x, mb_y = td->thread_mb_pos>>16, num_jobs = s->num_jobs;
     AVFrame *curframe = td->curframe;
     VP8Macroblock *mb = s->macroblocks_base + ((s->mb_width+1)*(mb_y + 1) + 1);
-    VP8ThreadData *prev_td = s->thread_data[FFMAX(0, threadnr-1)], *next_td = s->thread_data[FFMIN(threadnr+1,num_jobs-1)];
+    VP8ThreadData *prev_td, *next_td;
     uint8_t *dst[3] = {
         curframe->data[0] + 16*mb_y*s->linesize,
         curframe->data[1] +  8*mb_y*s->uvlinesize,
         curframe->data[2] +  8*mb_y*s->uvlinesize
     };
+    if (mb_y == 0) prev_td = td;
+    else           prev_td = s->thread_data[(jobnr+num_jobs-1)%num_jobs];
+    if (mb_y == s->mb_height-1) next_td = td;
+    else                        next_td = s->thread_data[(jobnr+1)%num_jobs];
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
         VP8FilterStrength *f = &mb->filter_strength;
-
         if (prev_td != td) {
-            int t = prev_td->thread_mb_x - (s->mb_width+1);
-            if (t < mb_x+1) {
-                pthread_mutex_lock(&prev_td->lock);
-                do {
-                    t = prev_td->thread_mb_x - (s->mb_width+1);
-                    if (t >= mb_x+1) break;
-                    pthread_cond_wait(&prev_td->cond, &prev_td->lock);
-                } while (1);
-                pthread_mutex_unlock(&prev_td->lock);
-            }
+            uint64_t asdf = AV_READ_TIME();
+            check_lock(td, prev_td, (mb_x+1) + (s->mb_width+2), mb_y-1, 1);
+            asdf = AV_READ_TIME() - asdf;
+            //printf("2: %d %llu\n", threadnr, asdf);
         }
-        if (next_td != td) {
-            int t = next_td->thread_mb_x;
-            if (t < mb_x+2) {
-                pthread_mutex_lock(&next_td->lock);
-                do {
-                    t = next_td->thread_mb_x;
-                    if (t >= mb_x+2) break;
-                    pthread_cond_wait(&next_td->cond, &next_td->lock);
-                } while (1);
-                pthread_mutex_unlock(&next_td->lock);
-            }
-        }
+        if (next_td != td)
+            check_lock(td, next_td, mb_x+2, mb_y+1, 0);
 
         if (s->filter.simple)
             filter_mb_simple(s, dst[0], f, mb_x, mb_y);
@@ -1737,23 +1743,29 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
         dst[1] += 8;
         dst[2] += 8;
 
-        pthread_mutex_lock(&td->lock);
-        td->thread_mb_x = (s->mb_width+1) + mb_x;
-        pthread_cond_broadcast(&td->cond);
-        pthread_mutex_unlock(&td->lock);
+        signal_lock(td, (mb_y<<16) | ((s->mb_width+2) + mb_x));
     }
 
-    pthread_mutex_lock(&td->lock);
-    td->thread_mb_x = INT_MAX;
-    pthread_cond_broadcast(&td->cond);
-    pthread_mutex_unlock(&td->lock);
+    signal_lock(td, ((mb_y+1)<<16) - 1); // (mb_y<<16) | (INT_MAX & 0xFFFF)
 }
 
 static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
-    vp8_decode_mb_row_no_filter(avctx, tdata, jobnr, threadnr);
-    if (s->deblock_filter)
-        vp8_filter_mb_row(avctx, tdata, jobnr, threadnr);
+    VP8ThreadData *td = s->thread_data[jobnr];
+    int mb_y, num_jobs = s->num_jobs;
+    for (mb_y = jobnr; mb_y < s->mb_height; mb_y += num_jobs) {
+        VP8ThreadData *prev_td, *next_td;
+        if (mb_y == 0) prev_td = td;
+        else           prev_td = s->thread_data[(jobnr+num_jobs-1)%num_jobs];
+        if (mb_y == s->mb_height-1) next_td = td;
+        else                        next_td = s->thread_data[(jobnr+1)%num_jobs];
+
+        if (mb_y >= s->mb_height) break;
+        td->thread_mb_pos = mb_y<<16;
+        vp8_decode_mb_row_no_filter(avctx, tdata, jobnr, threadnr);
+        if (s->deblock_filter)
+            vp8_filter_mb_row(avctx, tdata, jobnr, threadnr);
+    }
 
     return 0;
 }
@@ -1762,7 +1774,7 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
                             AVPacket *avpkt)
 {
     VP8Context *s = avctx->priv_data;
-    int ret, mb_y, i, referenced, num_jobs;
+    int ret, i, referenced, num_jobs;
     enum AVDiscard skip_thresh;
     AVFrame *av_uninit(curframe), *prev_frame;
 
@@ -1885,7 +1897,12 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
         num_jobs = 1;
     else
         num_jobs = FFMIN(s->num_coeff_partitions, avctx->thread_count);
-    for (mb_y = 0; mb_y < (s->mb_height+num_jobs-1)/num_jobs; mb_y++) {
+    s->num_jobs = num_jobs;
+    for (i = 0; i < MAX_THREADS; i++) {
+        s->thread_data[i]->curframe = curframe;
+        s->thread_data[i]->thread_mb_pos = 0;
+    }
+    /*for (mb_y = 0; mb_y < (s->mb_height+num_jobs-1)/num_jobs; mb_y++) {
         int t = num_jobs;
         for (i = 0; i < num_jobs; i++) {
             s->thread_data[i]->mb_y = mb_y*num_jobs + i;
@@ -1900,7 +1917,8 @@ static int vp8_decode_frame(AVCodecContext *avctx, void *data, int *data_size,
         avctx->execute2(avctx, vp8_decode_mb_row_sliced, s->thread_data, NULL, t);
 
         ff_thread_report_progress(curframe, mb_y*num_jobs, 0);
-    }
+    }*/
+    avctx->execute2(avctx, vp8_decode_mb_row_sliced, s->thread_data, NULL, num_jobs);
 
     ff_thread_report_progress(curframe, INT_MAX, 0);
     memcpy(&s->framep[0], &s->next_framep[0], sizeof(s->framep[0]) * 4);

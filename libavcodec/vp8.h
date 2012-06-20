@@ -93,8 +93,8 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  cond;
     int thread_nr;
-    int thread_mb_x;
-    int mb_y;
+    int thread_mb_pos; // (mb_y << 16) | mb_x
+    //int mb_y;
     uint8_t *edge_emu_buffer;
     /**
      * For coeff decode, we need to know whether the above block had non-zero
