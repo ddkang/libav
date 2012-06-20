@@ -103,11 +103,6 @@ typedef struct {
      */
     DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
     /**
-     * Cache of the top row needed for intra prediction
-     * 16 for luma, 8 for each chroma plane
-     */
-    uint8_t (*top_border)[16+8+8];
-    /**
      * This is the index plus one of the last non-zero coeff
      * for each of the blocks in the current macroblock.
      * So, 0 -> no coeffs
