@@ -1605,10 +1605,12 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     } while(0);
 #define signal_lock(td, pos)\
     do {\
+    if (s->num_jobs != 1) {\
     pthread_mutex_lock(&td->lock);\
     td->thread_mb_pos = (pos);\
     pthread_cond_broadcast(&td->cond);\
     pthread_mutex_unlock(&td->lock);\
+    }\
     } while(0);
 
 static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
@@ -1637,7 +1639,7 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         for (i = 0; i < 3; i++)
             for (y = 0; y < 16>>!!i; y++)
                 dst[i][y*curframe->linesize[i]-1] = 129;
-        if (mb_y >= 1) {
+        if (mb_y == 1) {
             s->top_border[0][15] = s->top_border[0][23] = s->top_border[0][31] = 129;
         }
         if (mb_y >= 1) {
@@ -1695,11 +1697,11 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         dst[1] += 8;
         dst[2] += 8;
 
-        if (mb_x != s->mb_width+1) {
-            signal_lock(td, (mb_y<<16) | mb_x);
-        }
-        else {
+        if (mb_x == s->mb_width+1) {
             signal_lock(td, (mb_y<<16) | s->mb_width+3);
+        }
+        else if (mb_x%2 == 0) {
+            signal_lock(td, (mb_y<<16) | mb_x);
         }
     }
 }
@@ -1753,11 +1755,11 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
         dst[1] += 8;
         dst[2] += 8;
 
-        if (mb_x != s->mb_width-1) {
-            signal_lock(td, (mb_y<<16) | ((s->mb_width+3) + mb_x));
-        }
-        else {
+        if (mb_x == s->mb_width-1) {
             signal_lock(td, ((mb_y+1)<<16) - 1); // (mb_y<<16) | (INT_MAX & 0xFFFF)
+        }
+        else if (mb_x%2 == 0){
+            signal_lock(td, (mb_y<<16) | ((s->mb_width+3) + mb_x));
         }
     }
 }
