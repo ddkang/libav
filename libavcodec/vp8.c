@@ -38,6 +38,10 @@
 
 static void free_buffers(VP8Context *s)
 {
+    int i;
+    for (i = 0; i < MAX_THREADS; i++) {
+        av_freep(&s->thread_data[i]);
+    }
     av_freep(&s->macroblocks_base);
     av_freep(&s->top_nnz);
     av_freep(&s->top_border);
@@ -128,6 +132,7 @@ static int update_dimensions(VP8Context *s, int width, int height)
 
     for (i = 0; i < MAX_THREADS; i++) {
         s->thread_data[i] = av_mallocz(sizeof(VP8ThreadData));
+        s->thread_data[i]->filter_strength = av_mallocz(s->mb_width*sizeof(*s->thread_data[0]->filter_strength));
         pthread_mutex_init(&s->thread_data[i]->lock, NULL);
         pthread_cond_init(&s->thread_data[i]->cond, NULL);
     }
@@ -1413,10 +1418,9 @@ chroma_idct_end: ;
     }
 }
 
-static av_always_inline void filter_level_for_mb(VP8Context *s, VP8Macroblock *mb)
+static av_always_inline void filter_level_for_mb(VP8Context *s, VP8Macroblock *mb, VP8FilterStrength *f)
 {
     int interior_limit, filter_level;
-    VP8FilterStrength *f = &mb->filter_strength;
 
     if (s->segmentation.enabled) {
         filter_level = s->segmentation.filter_level[mb->segment];
@@ -1684,7 +1688,7 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         }
 
         if (s->deblock_filter)
-            filter_level_for_mb(s, mb);
+            filter_level_for_mb(s, mb, &td->filter_strength[mb_x]);
 
         if (s->deblock_filter && num_jobs != 1 && threadnr == num_jobs-1) {
             if (s->filter.simple)
@@ -1724,7 +1728,7 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
     else                        next_td = s->thread_data[(jobnr+1)%num_jobs];
 
     for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
-        VP8FilterStrength *f = &mb->filter_strength;
+        VP8FilterStrength *f = &td->filter_strength[mb_x];
         if (prev_td != td) {
             //uint64_t asdf = AV_READ_TIME();
             check_lock(td, prev_td, (mb_x+1) + (s->mb_width+3), mb_y-1, 0);
@@ -1758,7 +1762,7 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
         if (mb_x == s->mb_width-1) {
             signal_lock(td, ((mb_y+1)<<16) - 1); // (mb_y<<16) | (INT_MAX & 0xFFFF)
         }
-        else if (mb_x%2 == 0){
+        else if (mb_x%2 == 0) {
             signal_lock(td, (mb_y<<16) | ((s->mb_width+3) + mb_x));
         }
     }

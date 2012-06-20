@@ -86,7 +86,6 @@ typedef struct {
     uint8_t intra4x4_pred_mode_left[4];
     VP56mv mv;
     VP56mv bmv[16];
-    VP8FilterStrength filter_strength;
 } VP8Macroblock;
 
 typedef struct {
@@ -112,6 +111,7 @@ typedef struct {
     DECLARE_ALIGNED(16, uint8_t, non_zero_count_cache)[6][4];
     DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
     DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
+    VP8FilterStrength *filter_strength;
     AVFrame *curframe;
 } VP8ThreadData;
 
