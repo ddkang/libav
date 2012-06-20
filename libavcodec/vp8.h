@@ -101,7 +101,6 @@ typedef struct {
      * blocks, 2 u blocks, 2 v blocks, and the luma dc block, for a total of 9
      * per macroblock. We keep the last row in top_nnz.
      */
-    uint8_t (*top_nnz)[9];
     DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
     /**
      * Cache of the top row needed for intra prediction
