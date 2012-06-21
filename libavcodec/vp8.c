@@ -1586,20 +1586,17 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
 
 #undef printf
 //#define printf(...) NULL;
-#define check_lock(td, otd, mb_x_check, mb_y_check, check2)\
+/*#define check_lock(td, otd, mb_x_check, mb_y_check, check2)\
     do {\
         int tmp = otd->thread_mb_pos;\
         int otd_mb_y = tmp >> 16;\
         int otd_mb_x = tmp & 0xFFFF;\
-        /*printf("%d %d\n", s->mb_width, s->mb_height);*/\
-        /*printf("%d: %d %d, %d %d, %d %d\n", threadnr, td->thread_mb_pos >> 16, td->thread_mb_pos & 0xFFFF, otd_mb_y, otd_mb_x, mb_y_check, mb_x_check);*/\
         if (otd_mb_y < (mb_y_check) || (otd_mb_y == (mb_y_check) && otd_mb_x < (mb_x_check))) {\
             pthread_mutex_lock(&otd->lock);\
             do {\
                 tmp = otd->thread_mb_pos;\
                 otd_mb_y = tmp >> 16;\
                 otd_mb_x = tmp & 0xFFFF;\
-                /*printf("%d: %d %d, %d %d, %d %d\n", threadnr, td->thread_mb_pos >> 16, td->thread_mb_pos & 0xFFFF, otd_mb_y, otd_mb_x, mb_y_check, mb_x_check);*/\
                 if (otd_mb_y > (mb_y_check)) break;\
                 if (otd_mb_y == (mb_y_check) && otd_mb_x >= (mb_x_check)) break;\
                 pthread_cond_wait(&otd->cond, &otd->lock);\
@@ -1615,6 +1612,23 @@ static void vp8_decode_mv_mb_modes(AVCodecContext *avctx, AVFrame *curframe, AVF
     pthread_cond_broadcast(&td->cond);\
     pthread_mutex_unlock(&td->lock);\
     }\
+    } while(0);*/
+#define x86_pause_hint()\
+    __asm__ __volatile__ ("pause \n\t")
+#define thread_sleep(nms) sched_yield();
+#define check_lock(td, otd, mb_x_check, mb_y_check, check2)\
+    do {\
+        int tmp = otd->thread_mb_pos;\
+        int otd_mb_y = tmp >> 16;\
+        int otd_mb_x = tmp & 0xFFFF;\
+        if (otd_mb_y > (mb_y_check)) break;\
+        if (otd_mb_y == (mb_y_check) && otd_mb_x >= (mb_x_check)) break;\
+        x86_pause_hint();\
+        thread_sleep();\
+    } while(1);
+#define signal_lock(td, pos)\
+    do {\
+        td->thread_mb_pos = (pos);\
     } while(0);
 
 static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
@@ -1666,6 +1680,10 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
             //printf("1: %d %llu\n", threadnr, asdf);
         }
 
+        s->dsp.prefetch(dst[0] + (mb_x&3)*4*s->linesize + 64, s->linesize, 4);
+        s->dsp.prefetch(dst[1] + (mb_x&7)*s->uvlinesize + 64, dst[2] - dst[1], 2);
+        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_PREVIOUS);
+
         if (!mb->skip)
             decode_mb_coeffs(s, td, c, mb, s->top_nnz[mb_x], td->left_nnz);
 
@@ -1673,6 +1691,8 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
             intra_predict(s, td, dst, mb, mb_x, mb_y);
         else
             inter_predict(s, td, dst, mb, mb_x, mb_y);
+
+        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_GOLDEN);
 
         if (!mb->skip) {
             idct_mb(s, td, dst, mb);
@@ -1700,6 +1720,8 @@ static void vp8_decode_mb_row_no_filter(AVCodecContext *avctx, void *tdata, int 
         dst[0] += 16;
         dst[1] += 8;
         dst[2] += 8;
+
+        prefetch_motion(s, mb, mb_x, mb_y, mb_xy, VP56_FRAME_GOLDEN2);
 
         if (mb_x == s->mb_width+1) {
             signal_lock(td, (mb_y<<16) | s->mb_width+3);
@@ -1771,6 +1793,7 @@ static void vp8_filter_mb_row(AVCodecContext *avctx, void *tdata, int jobnr, int
 static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobnr, int threadnr) {
     VP8Context *s = avctx->priv_data;
     VP8ThreadData *td = s->thread_data[jobnr];
+    AVFrame *curframe = td->curframe;
     int mb_y, num_jobs = s->num_jobs;
     td->thread_nr = threadnr;
     for (mb_y = jobnr; mb_y < s->mb_height; mb_y += num_jobs) {
@@ -1782,6 +1805,9 @@ static int vp8_decode_mb_row_sliced(AVCodecContext *avctx, void *tdata, int jobn
         else {
             signal_lock(td, ((mb_y+1)<<16) - 1); // (mb_y<<16) | (INT_MAX & 0xFFFF)
         }
+
+        if (avctx->active_thread_type == FF_THREAD_FRAME)
+            ff_thread_report_progress(curframe, mb_y, 0);
     }
 
     return 0;
