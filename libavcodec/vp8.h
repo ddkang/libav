@@ -83,16 +83,43 @@ typedef struct {
     uint8_t segment;
     uint8_t intra4x4_pred_mode_mb[16];
     uint8_t intra4x4_pred_mode_top[4];
-    uint8_t intra4x4_pred_mode_left[4];
     VP56mv mv;
     VP56mv bmv[16];
 } VP8Macroblock;
 
 typedef struct {
+    //pthread_mutex_t lock;
+    //pthread_cond_t  cond;
+    int thread_nr;
+    int thread_mb_pos; // (mb_y << 16) | mb_x
+    uint8_t *edge_emu_buffer;
+    /**
+     * For coeff decode, we need to know whether the above block had non-zero
+     * coefficients. This means for each macroblock, we need data for 4 luma
+     * blocks, 2 u blocks, 2 v blocks, and the luma dc block, for a total of 9
+     * per macroblock. We keep the last row in top_nnz.
+     */
+    DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
+    /**
+     * This is the index plus one of the last non-zero coeff
+     * for each of the blocks in the current macroblock.
+     * So, 0 -> no coeffs
+     *     1 -> dc-only (special transform)
+     *     2+-> full transform
+     */
+    DECLARE_ALIGNED(16, uint8_t, non_zero_count_cache)[6][4];
+    DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
+    DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
+    VP8FilterStrength *filter_strength;
+} VP8ThreadData;
+
+#define MAX_THREADS 8
+typedef struct {
+    VP8ThreadData *thread_data;
     AVCodecContext *avctx;
     AVFrame *framep[4];
     AVFrame *next_framep[4];
-    uint8_t *edge_emu_buffer;
+    AVFrame *curframe;
 
     uint16_t mb_width;   /* number of horizontal MB */
     uint16_t mb_height;  /* number of vertical MB */
@@ -131,6 +158,8 @@ typedef struct {
     VP8Macroblock *macroblocks;
     VP8FilterStrength *filter_strength;
 
+    uint8_t intra4x4_pred_mode_left[4];
+
     /**
      * Macroblocks can have one of 4 different quants in a frame when
      * segmentation is enabled.
@@ -167,32 +196,10 @@ typedef struct {
         int8_t ref[4];
     } lf_delta;
 
-    /**
-     * Cache of the top row needed for intra prediction
-     * 16 for luma, 8 for each chroma plane
-     */
     uint8_t (*top_border)[16+8+8];
-
-    /**
-     * For coeff decode, we need to know whether the above block had non-zero
-     * coefficients. This means for each macroblock, we need data for 4 luma
-     * blocks, 2 u blocks, 2 v blocks, and the luma dc block, for a total of 9
-     * per macroblock. We keep the last row in top_nnz.
-     */
     uint8_t (*top_nnz)[9];
-    DECLARE_ALIGNED(8, uint8_t, left_nnz)[9];
 
-    /**
-     * This is the index plus one of the last non-zero coeff
-     * for each of the blocks in the current macroblock.
-     * So, 0 -> no coeffs
-     *     1 -> dc-only (special transform)
-     *     2+-> full transform
-     */
-    DECLARE_ALIGNED(16, uint8_t, non_zero_count_cache)[6][4];
     VP56RangeCoder c;   ///< header context, includes mb modes and motion vectors
-    DECLARE_ALIGNED(16, DCTELEM, block)[6][4][16];
-    DECLARE_ALIGNED(16, DCTELEM, block_dc)[16];
 
     /**
      * These are all of the updatable probabilities for binary decisions.
@@ -245,6 +252,7 @@ typedef struct {
     uint8_t *segmentation_maps[5];
     int num_maps_to_be_freed;
     int maps_are_invalid;
+    int num_jobs;
 } VP8Context;
 
 #endif /* AVCODEC_VP8_H */
