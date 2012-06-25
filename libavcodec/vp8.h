@@ -120,6 +120,7 @@ typedef struct {
     AVFrame *framep[4];
     AVFrame *next_framep[4];
     AVFrame *curframe;
+    AVFrame *prev_frame;
 
     uint16_t mb_width;   /* number of horizontal MB */
     uint16_t mb_height;  /* number of vertical MB */
@@ -156,8 +157,8 @@ typedef struct {
     } filter;
 
     VP8Macroblock *macroblocks;
-    VP8FilterStrength *filter_strength;
 
+    uint8_t *intra4x4_pred_mode_top;
     uint8_t intra4x4_pred_mode_left[4];
 
     /**
@@ -253,6 +254,12 @@ typedef struct {
     int num_maps_to_be_freed;
     int maps_are_invalid;
     int num_jobs;
+    /**
+     * This describes the macroblock memory layout.
+     * 0 -> Only width+height*2+1 macroblocks allocated (frame/single thread).
+     * 1 -> Macroblocks for entire frame alloced (sliced thread).
+     */
+    int mlayout;
 } VP8Context;
 
 #endif /* AVCODEC_VP8_H */
